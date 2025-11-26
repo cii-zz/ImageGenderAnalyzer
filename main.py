@@ -256,9 +256,6 @@ class SimpleGenderDetector:
             return None
 
     def _classify_face_sync(self, face):
-        """
-        直接进行人脸性别识别，不使用多角度旋转
-        """
         try:
             if len(face.shape) == 3:
                 rgb_face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
@@ -329,7 +326,7 @@ async def process_all_users(detector, df, concurrency=20):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='性别识别系统')
+    parser = argparse.ArgumentParser(description='性别识别')
     parser.add_argument('--input_excel', default='input.xlsx', help='输入Excel文件')
     parser.add_argument('--output_excel', default='output.xlsx', help='输出Excel文件')
     parser.add_argument('--gpu', default=-1, type=int, help='GPU ID')
