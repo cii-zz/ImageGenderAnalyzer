@@ -48,8 +48,14 @@ class SimpleGenderDetector:
             self.model = None
 
         try:
-            import cnocr
-            self.ocr = cnocr.CnOcr()
+            from cnocr import CnOcr
+            self.ocr = CnOcr(
+                rec_model_name='doc-densenet_lite_136-gru',  # 识别模型
+                det_model_name='ch_PP-OCRv5_det',  # 检测模型
+                rec_model_backend='onnx',  # 识别模型使用ONNX后端
+                det_model_backend='onnx',  # 检测模型使用ONNX后端
+                context='gpu' if self.args.gpu >= 0 and torch.cuda.is_available() else 'cpu'  # 根据参数自动选择
+            )
         except Exception as e:
             logger.warning(f"OCR加载失败: {e}")
             self.ocr = None
@@ -69,6 +75,7 @@ class SimpleGenderDetector:
                 if image is None:
                     continue
 
+                # OCR文本识别
                 ocr_text = await self._extract_text(image)
                 ocr_gender = self._gender_from_text(ocr_text)
 
@@ -77,6 +84,7 @@ class SimpleGenderDetector:
                     logger.info(f"OCR检测到性别: {ocr_gender}")
                     continue
 
+                # 人脸检测和性别识别
                 faces = await self._detect_faces(image)
                 if faces:
                     face_gender = await self._classify_faces(faces)
@@ -132,12 +140,14 @@ class SimpleGenderDetector:
             else:
                 rgb_image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
+            # 图像尺寸调整
             h, w = rgb_image.shape[:2]
             if max(h, w) > 1200:
                 scale = 1200 / max(h, w)
                 new_size = (int(w * scale), int(h * scale))
                 rgb_image = cv2.resize(rgb_image, new_size)
 
+            # OCR识别
             results = self.ocr.ocr(rgb_image)
             text = ' '.join([r['text'] for r in results])
             return text if len(text) > 0 else ""
@@ -148,8 +158,9 @@ class SimpleGenderDetector:
         if not text:
             return None
 
-        male_words = ['男']
-        female_words = ['女']
+        # 扩展性别关键词，包括中英文
+        male_words = ['男', 'male', 'Male', 'MALE', '先生', '男士', '男生', '男人', 'man', 'Man']
+        female_words = ['女', 'female', 'Female', 'FEMALE', '女士', '女生', '女人', '小姐', 'woman', 'Woman']
 
         has_male = any(word in text for word in male_words)
         has_female = any(word in text for word in female_words)
@@ -238,7 +249,6 @@ class SimpleGenderDetector:
                     genders.append(gender)
 
             if genders:
-                from collections import Counter
                 gender_counter = Counter(genders)
                 return gender_counter.most_common(1)[0][0]
             return None
@@ -246,41 +256,50 @@ class SimpleGenderDetector:
             return None
 
     def _classify_face_sync(self, face):
+        """
+        直接进行人脸性别识别，不使用多角度旋转
+        """
         try:
             if len(face.shape) == 3:
                 rgb_face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
             else:
                 rgb_face = cv2.cvtColor(face, cv2.COLOR_GRAY2RGB)
 
+            # 预处理
             resized = cv2.resize(rgb_face, (224, 224))
             pil_image = PILImage.fromarray(resized)
 
+            # 模型预测
             inputs = self.processor(images=pil_image, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
             with torch.no_grad():
                 outputs = self.model(**inputs)
                 probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                conf, pred = torch.max(probs, 1)
+                _, pred = torch.max(probs, 1)
 
+            # 返回预测结果
             return '女' if pred.item() % 2 == 0 else '男'
-        except:
+
+        except Exception as e:
+            logger.debug(f"性别分类失败: {e}")
             return None
 
     def _decide_gender(self, gender_results):
         if not gender_results:
             return "未知"
-        from collections import Counter
+
         gender_counter = Counter(gender_results)
         most_common = gender_counter.most_common(1)
+
         if most_common:
             return most_common[0][0]
         return "未知"
 
 
-async def process_all_users(detector, df, concurrency=5):
+async def process_all_users(detector, df, concurrency=20):
     semaphore = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=10)
+    connector = aiohttp.TCPConnector(limit=20)
     results = []
 
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -292,7 +311,7 @@ async def process_all_users(detector, df, concurrency=5):
             task = detector.process_user(email, urls, session, semaphore)
             tasks.append(task)
 
-        batch_size = 20
+        batch_size = 25
         for i in range(0, len(tasks), batch_size):
             batch = tasks[i:i + batch_size]
             batch_results = await asyncio.gather(*batch, return_exceptions=True)
@@ -316,7 +335,7 @@ def main():
     parser.add_argument('--gpu', default=-1, type=int, help='GPU ID')
     parser.add_argument('--start', default=0, type=int, help='起始位置')
     parser.add_argument('--limit', default=0, type=int, help='处理条数')
-    parser.add_argument('--concurrency', default=15, type=int, help='并发数')
+    parser.add_argument('--concurrency', default=20, type=int, help='并发数')
 
     args = parser.parse_args()
 
