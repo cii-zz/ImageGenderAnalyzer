@@ -1,5 +1,7 @@
 import argparse
 import os
+import warnings
+
 import cv2
 import asyncio
 import aiohttp
@@ -18,6 +20,12 @@ import time
 register_heif_opener()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+warnings.filterwarnings('ignore', category=FutureWarning,
+                        message='.*rcond parameter will change to the default.*')
+warnings.filterwarnings('ignore', category=np.RankWarning)
+warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+warnings.filterwarnings('ignore', category=UserWarning, module='albumentations')
 
 
 class SimpleGenderDetector:
@@ -68,7 +76,7 @@ class SimpleGenderDetector:
 
         urls = urls[:3]
         gender_results = []
-        method_results = []  # 存储识别方式
+        method_results = []
 
         for url in urls:
             try:
@@ -76,24 +84,38 @@ class SimpleGenderDetector:
                 if image is None:
                     continue
 
-                # OCR文本识别
-                ocr_text = await self._extract_text(image)
-                ocr_gender = self._gender_from_text(ocr_text)
+                rotated_images = self._generate_rotations(image)
 
-                if ocr_gender is not None:
-                    gender_results.append(ocr_gender)
-                    method_results.append(0)  # 0表示OCR识别
-                    logger.info(f"OCR检测到性别: {ocr_gender}")
-                    continue
+                best_gender = None
+                best_method = None
 
-                # 人脸检测和性别识别
-                faces = await self._detect_faces(image)
-                if faces:
-                    face_gender = await self._classify_faces(faces)
-                    if face_gender is not None:
-                        gender_results.append(face_gender)
-                        method_results.append(1)  # 1表示模型识别
-                        logger.info(f"人脸检测到性别: {face_gender}")
+                for rot_img in rotated_images:
+
+                    # → OCR 尝试
+                    ocr_text = await self._extract_text(rot_img)
+                    ocr_gender = self._gender_from_text(ocr_text)
+
+                    if ocr_gender is not None:
+                        best_gender = ocr_gender
+                        best_method = 0
+                        logger.info(f"OCR检测到性别: {ocr_gender}")
+                        break  # OCR 优先，成功立即停止
+
+                    # → 人脸检测
+                    faces = await self._detect_faces(rot_img)
+                    if faces:
+                        face_gender = await self._classify_faces(faces)
+                        if face_gender is not None:
+                            best_gender = face_gender
+                            best_method = 1
+                            logger.info(f"人脸检测到性别: {face_gender}")
+                            # 注意：不能 break，人脸只是 OCR 的备选，但单角度找到即可
+                            break
+
+                # 记录该 URL 的结果
+                if best_gender is not None:
+                    gender_results.append(best_gender)
+                    method_results.append(best_method)
 
             except Exception as e:
                 logger.debug(f"处理图片失败: {e}")
@@ -102,6 +124,7 @@ class SimpleGenderDetector:
         final_gender, final_method = self._decide_gender(gender_results, method_results)
         logger.info(f"用户 {email} 最终结果: {final_gender}, 识别方式: {final_method}")
         return {'email': email, 'gender': final_gender, 'method': final_method, 'original_urls': ','.join(urls)}
+
 
     async def _download_image(self, session, url, semaphore):
         async with semaphore:
@@ -116,6 +139,15 @@ class SimpleGenderDetector:
             except Exception as e:
                 logger.debug(f"下载失败: {e}")
                 return None
+
+    def _generate_rotations(self, image):
+        """生成 0°, 90°, 180°, 270° 四张图"""
+        rotations = [image]
+        rotations.append(cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE))
+        rotations.append(cv2.rotate(image, cv2.ROTATE_180))
+        rotations.append(cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE))
+        return rotations
+
 
     def _bytes_to_cv2(self, image_data):
         try:

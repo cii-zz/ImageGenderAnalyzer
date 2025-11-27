@@ -1,5 +1,7 @@
 import argparse
 import os
+import warnings
+
 import cv2
 import asyncio
 import aiohttp
@@ -19,6 +21,12 @@ register_heif_opener()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+warnings.filterwarnings('ignore', category=FutureWarning,
+                        message='.*rcond parameter will change to the default.*')
+warnings.filterwarnings('ignore', category=np.RankWarning)
+warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+warnings.filterwarnings('ignore', category=UserWarning, module='albumentations')
+
 
 class SimpleGenderDetector:
     def __init__(self, args):
@@ -36,16 +44,16 @@ class SimpleGenderDetector:
             logger.error(f"人脸检测器加载失败: {e}")
             self.face_detector = None
 
-        try:
-            self.device = torch.device('cuda' if self.args.gpu >= 0 and torch.cuda.is_available() else 'cpu')
-            model_name = "rizvandwiki/gender-classification"
-            self.processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
-            self.model = AutoModelForImageClassification.from_pretrained(model_name)
-            self.model.to(self.device)
-            self.model.eval()
-        except Exception as e:
-            logger.error(f"性别分类器加载失败: {e}")
-            self.model = None
+        # try:
+        #     self.device = torch.device('cuda' if self.args.gpu >= 0 and torch.cuda.is_available() else 'cpu')
+        #     model_name = "rizvandwiki/gender-classification"
+        #     self.processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
+        #     self.model = AutoModelForImageClassification.from_pretrained(model_name)
+        #     self.model.to(self.device)
+        #     self.model.eval()
+        # except Exception as e:
+        #     logger.error(f"性别分类器加载失败: {e}")
+        #     self.model = None
 
         try:
             from cnocr import CnOcr
@@ -68,7 +76,7 @@ class SimpleGenderDetector:
 
         urls = urls[:3]
         gender_results = []
-        method_results = []  # 存储识别方式
+        method_results = []
 
         for url in urls:
             try:
@@ -76,24 +84,38 @@ class SimpleGenderDetector:
                 if image is None:
                     continue
 
-                # OCR文本识别
-                ocr_text = await self._extract_text(image)
-                ocr_gender = self._gender_from_text(ocr_text)
+                rotated_images = self._generate_rotations(image)
 
-                if ocr_gender is not None:
-                    gender_results.append(ocr_gender)
-                    method_results.append(0)  # 0表示OCR识别
-                    logger.info(f"OCR检测到性别: {ocr_gender}")
-                    continue
+                best_gender = None
+                best_method = None
 
-                # 人脸检测和性别识别
-                faces = await self._detect_faces(image)
-                if faces:
-                    face_gender = await self._classify_faces(faces)
-                    if face_gender is not None:
-                        gender_results.append(face_gender)
-                        method_results.append(1)  # 1表示模型识别
-                        logger.info(f"人脸检测到性别: {face_gender}")
+                for rot_img in rotated_images:
+
+                    # → OCR 尝试
+                    ocr_text = await self._extract_text(rot_img)
+                    ocr_gender = self._gender_from_text(ocr_text)
+
+                    if ocr_gender is not None:
+                        best_gender = ocr_gender
+                        best_method = 0
+                        logger.info(f"OCR检测到性别: {ocr_gender}")
+                        break  # OCR 优先，成功立即停止
+
+                    # → 人脸检测
+                    faces = await self._detect_faces(rot_img)
+                    if faces:
+                        face_gender = await self._classify_faces(faces)
+                        if face_gender is not None:
+                            best_gender = face_gender
+                            best_method = 1
+                            logger.info(f"人脸检测到性别: {face_gender}")
+                            # 注意：不能 break，人脸只是 OCR 的备选，但单角度找到即可
+                            break
+
+                # 记录该 URL 的结果
+                if best_gender is not None:
+                    gender_results.append(best_gender)
+                    method_results.append(best_method)
 
             except Exception as e:
                 logger.debug(f"处理图片失败: {e}")
@@ -116,6 +138,14 @@ class SimpleGenderDetector:
             except Exception as e:
                 logger.debug(f"下载失败: {e}")
                 return None
+
+    def _generate_rotations(self, image):
+        """生成 0°, 90°, 180°, 270° 四张图"""
+        rotations = [image]
+        rotations.append(cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE))
+        rotations.append(cv2.rotate(image, cv2.ROTATE_180))
+        rotations.append(cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE))
+        return rotations
 
     def _bytes_to_cv2(self, image_data):
         try:
@@ -223,33 +253,24 @@ class SimpleGenderDetector:
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             faces = self.face_detector.get(rgb_image)
 
-            cropped_faces = []
+            valid_faces = []
             for face in faces:
                 if face.det_score >= 0.6:
-                    x1, y1, x2, y2 = map(int, face.bbox)
-                    expand = int((x2 - x1) * 0.1)
-                    x1, y1 = max(0, x1 - expand), max(0, y1 - expand)
-                    x2, y2 = min(image.shape[1], x2 + expand), min(image.shape[0], y2 + expand)
+                    valid_faces.append(face)
 
-                    face_img = image[y1:y2, x1:x2]
-                    if face_img.size > 0:
-                        cropped_faces.append(face_img)
-
-            return cropped_faces[:3]
+            return valid_faces[:3]
         except:
             return []
 
     async def _classify_faces(self, faces):
-        if self.model is None or not faces:
+        if not faces:
             return None
         try:
             genders = []
             for face in faces:
-                gender = await asyncio.get_event_loop().run_in_executor(
-                    self.thread_pool, self._classify_face_sync, face
-                )
-                if gender is not None:
-                    genders.append(gender)
+                # InsightFace: gender = 1 male, 0 female
+                g = face.gender
+                genders.append('男' if g == 1 else '女')
 
             if genders:
                 gender_counter = Counter(genders)
@@ -260,26 +281,13 @@ class SimpleGenderDetector:
 
     def _classify_face_sync(self, face):
         try:
-            if len(face.shape) == 3:
-                rgb_face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-            else:
-                rgb_face = cv2.cvtColor(face, cv2.COLOR_GRAY2RGB)
+            rgb_face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+            analysis = self.face_detector.get(rgb_face)
 
-            # 预处理
-            resized = cv2.resize(rgb_face, (224, 224))
-            pil_image = PILImage.fromarray(resized)
-
-            # 模型预测
-            inputs = self.processor(images=pil_image, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                _, pred = torch.max(probs, 1)
-
-            # 返回预测结果
-            return '女' if pred.item() % 2 == 0 else '男'
+            if len(analysis) > 0:
+                g = analysis[0].gender  # 1 male, 0 female
+                return '男' if g == 1 else '女'
+            return None
 
         except Exception as e:
             logger.debug(f"性别分类失败: {e}")
@@ -391,7 +399,7 @@ def main():
     print(f"\n处理完成!")
     print(f"总用户数: {len(result_df)}")
     print(f"总耗时: {processing_time:.2f}秒")
-    print(f"平均时间: {processing_time/len(result_df):.2f}秒/用户")
+    print(f"平均时间: {processing_time / len(result_df):.2f}秒/用户")
     print(f"性别分布: {dict(gender_stats)}")
     print(f"识别方式分布: {dict(method_stats)}")
     print(f"输出文件: {args.output_excel}")
