@@ -1,0 +1,8 @@
+aiohttp==3.13.1
+opencv-python==4.10.0
+numpy==1.26.4
+pandas==2.3.0
+torch==2.9.1+cpu
+torchvision==0.24.1+cpu
+Pillow==11.2.1
+cnocr==2.3.2.2
